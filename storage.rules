@@ -1,0 +1,71 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Foydalanuvchi avatarlari (User avatars)
+    match /avatars/{userId}/{fileName} {
+      allow read: if isAuthenticated();
+      allow write: if isOwner(userId)
+                   && request.resource.size < 10 * 1024 * 1024 // 10MB max
+                   && request.resource.contentType.matches('image/.*');
+    }
+
+    // Guruh va Kanal avatarlari (Group & Channel avatars)
+    match /group_avatars/{chatId}/{fileName} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated()
+                   && request.resource.size < 10 * 1024 * 1024 // 10MB max
+                   && request.resource.contentType.matches('image/.*');
+    }
+
+    // Chat media fayllari (rasmlar, videolar, audio, hujjatlar)
+    match /chats/{chatId}/{fileName} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated()
+                   && request.resource.size < 100 * 1024 * 1024; // 100MB max
+    }
+
+    // Maxfiy chat shifrlangan media fayllari (Encrypted Media)
+    match /secret_chats/{chatId}/media/{mediaId} {
+      function isSecretParticipant() {
+        return isAuthenticated() &&
+          firestore.exists(/databases/(default)/documents/secret_chats/$(chatId)) &&
+          request.auth.uid in firestore.get(/databases/(default)/documents/secret_chats/$(chatId)).data.participants;
+      }
+
+      function isSecretChatActive() {
+        return isSecretParticipant() &&
+          firestore.get(/databases/(default)/documents/secret_chats/$(chatId)).data.status == 'active';
+      }
+
+      // Faqat tasdiqlangan chat ishtirokchisi shifrlangan mediani yuklab olishi mumkin (Download)
+      allow read: if isSecretParticipant();
+
+      // Faqat faol chat ishtirokchisi shifrlangan baytlarni yuklashi mumkin (Upload <= 25MB)
+      allow create: if isSecretChatActive()
+                    && request.resource.size < 25 * 1024 * 1024; // 25MB max
+
+      // Shifrlangan faylni yangilash / ustidan yozish qat'iyan taqiqlanadi (Immutable)
+      allow update: if false;
+
+      // Faqat chat ishtirokchisi yo'qoluvchi xabar doirasida shifrlangan faylni o'chira oladi (Delete)
+      allow delete: if isSecretParticipant();
+    }
+
+    // Foydalanuvchining shaxsiy saqlangan fayllari (Saved Messages & Personal Cloud Storage)
+    match /users/{userId}/saved_files/{fileName} {
+      allow read, delete: if isOwner(userId);
+      allow create: if isOwner(userId)
+                    && request.resource.size < 50 * 1024 * 1024; // 50MB max
+      allow update: if false; // Fayllarni ustidan yozish taqiqlanadi (Immutable)
+    }
+  }
+}

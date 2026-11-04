@@ -1,0 +1,494 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Umumiy helper funksiyalar (Helper functions)
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Foydalanuvchilar to'plami (Users collection)
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isOwner(userId);
+      allow delete: if false; // Foydalanuvchi hisobini to'g'ridan-to'g'ri o'chirish taqiqlangan
+
+      // Foydalanuvchining chat papkalari (Chat folders subcollection)
+      match /folders/{folderId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // Ovozsiz qilingan chatlar (Muted chats preference per-user)
+      match /muted_chats/{chatId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // Foydalanuvchining stiker sozlamalari (Sticker preferences subcollection)
+      match /sticker_prefs/{prefId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // Foydalanuvchining maxfiy chat qurilmalari (Secret Chat devices subcollection)
+      match /devices/{deviceId} {
+        allow read: if isAuthenticated();
+        allow create: if isOwner(userId) &&
+          request.resource.data.revoked == false &&
+          request.resource.data.identityPublicKey is string &&
+          request.resource.data.registrationId is int;
+        allow update: if isOwner(userId) &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['identityPublicKey', 'registrationId', 'createdAt']) &&
+          (resource.data.revoked != true || request.resource.data.revoked == true);
+        allow delete: if false;
+
+        // One-time prekeys
+        match /prekeys/{prekeyId} {
+          allow read: if isAuthenticated();
+          allow create: if isOwner(userId);
+          allow update: if isAuthenticated();
+          allow delete: if isOwner(userId);
+        }
+      }
+
+      // Rejalashtirilgan xabarlar (Scheduled messages private subcollection)
+      match /scheduled_messages/{scheduledMessageId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) &&
+          request.resource.data.senderId == request.auth.uid &&
+          request.resource.data.scheduledAt is timestamp &&
+          request.resource.data.scheduledAt > request.time &&
+          request.resource.data.status == 'pending';
+        allow update: if isOwner(userId) &&
+          resource.data.status == 'pending' &&
+          request.resource.data.status in ['canceled', 'sent', 'failed'] &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'senderId', 'chatId', 'text', 'messageId', 'scheduledAt', 'createdAt', 'isSilent'
+          ]);
+        allow delete: if isOwner(userId);
+      }
+
+      // Saqlangan xabarlar va shaxsiy bulut xotirasi (Saved messages & personal cloud storage)
+      match /saved_messages/{savedMessageId} {
+        allow read, delete: if isOwner(userId);
+        allow create: if isOwner(userId) &&
+          request.resource.data.ownerId == request.auth.uid;
+        allow update: if isOwner(userId) &&
+          request.resource.data.ownerId == request.auth.uid;
+      }
+
+      // In-app bildirishnomalar (Notifications subcollection)
+      match /notifications/{notificationId} {
+        allow read, update, delete: if isOwner(userId);
+        allow create: if isAuthenticated() && request.resource.data.senderId == request.auth.uid;
+      }
+    }
+
+    // Stiker to'plamlari katalogi (Sticker packs collection)
+    match /sticker_packs/{packId} {
+      allow read: if isAuthenticated();
+      allow write: if false; // Faqat backend / admin konsol orqali boshqariladi
+    }
+
+    // Chatlar, Kanallar va Guruhlar to'plami (Chats, Channels & Groups)
+    match /chats/{chatId} {
+      
+      function getChat() {
+        return resource.data;
+      }
+
+      function isPublicChat() {
+        return resource.data.type == 'public' || (resource.data.isChannel == true && resource.data.type != 'private');
+      }
+
+      function isParticipant() {
+        return isAuthenticated() && (
+          request.auth.uid in resource.data.participants ||
+          request.auth.uid == resource.data.createdBy
+        );
+      }
+
+      function memberDocExists(uid) {
+        return exists(/databases/$(database)/documents/chats/$(chatId)/members/$(uid));
+      }
+
+      function getMemberData(uid) {
+        return get(/databases/$(database)/documents/chats/$(chatId)/members/$(uid)).data;
+      }
+
+      function isMember() {
+        return isAuthenticated() && (
+          isParticipant() ||
+          memberDocExists(request.auth.uid)
+        );
+      }
+
+      function isOwnerOrAdmin() {
+        return isAuthenticated() && (
+          request.auth.uid == resource.data.createdBy ||
+          (memberDocExists(request.auth.uid) && (
+            getMemberData(request.auth.uid).role == 'owner' ||
+            getMemberData(request.auth.uid).role == 'admin'
+          ))
+        );
+      }
+
+      function isGroupOwner() {
+        return isAuthenticated() && (
+          request.auth.uid == resource.data.createdBy ||
+          (memberDocExists(request.auth.uid) && getMemberData(request.auth.uid).role == 'owner')
+        );
+      }
+
+      // O'qish huquqi (Read):
+      // - Ochiq kanal yoki guruh bo'lsa hamma autentifikatsiyadan o'tgan foydalanuvchilar o'qiy oladi
+      // - Yopiq bo'lsa faqat a'zo yoki ishtirokchilar
+      allow read: if isAuthenticated() && (
+        isPublicChat() || isMember()
+      );
+
+      // Yaratish huquqi (Create):
+      // Autentifikatsiyadan o'tgan har qanday foydalanuvchi yaratishi mumkin (yaratuvchi createdBy bo'lishi shart yoki direct chat participants a'zosi)
+      allow create: if isAuthenticated() && (
+        request.resource.data.createdBy == request.auth.uid ||
+        (request.resource.data.type == 'direct' && request.auth.uid in request.resource.data.participants)
+      );
+
+      // Yangilash huquqi (Update):
+      // 1. Chat ma'lumotlarini (nomi, avatar, tavsif, username, slowMode va h.k.) faqat owner yoki admin o'zgartira oladi
+      // 2. Oddiy a'zolar guruh metama'lumotlarini o'zgartira olmaydi
+      // 3. Ochiq chatlarda o'zini participants ro'yxatiga qo'shish (join) ruxsat berilgan
+      allow update: if isAuthenticated() && (
+        isOwnerOrAdmin() ||
+        (isMember() && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+          'description', 'username', 'name', 'groupName', 'groupAvatar', 'photoUrl', 'isChannel', 'type', 'createdBy', 'createdAt', 'inviteLink', 'slowMode'
+        ])) ||
+        (isPublicChat() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['participants', 'userNames', 'userPhotos', 'unreadCount', 'memberCount']))
+      );
+
+      // O'chirish huquqi (Delete):
+      // Faqat chat egasi (Owner) o'chira oladi
+      allow delete: if isGroupOwner();
+
+      // A'zolar subcollection'i (Members subcollection)
+      match /members/{memberId} {
+        allow read: if isAuthenticated() && (
+          isPublicChat() || isMember()
+        );
+
+        // A'zo qo'shilish / chiqarish / rolni o'zgartirish
+        allow create: if isAuthenticated() && (
+          // O'zi qo'shilishi (join)
+          (memberId == request.auth.uid && (isPublicChat() || isParticipant())) ||
+          // Admin yoki Owner boshqa a'zoni qo'shishi
+          isOwnerOrAdmin()
+        );
+
+        allow update: if isAuthenticated() && (
+          // Faqat Admin yoki Owner boshqalarning ruxsat va rollarini o'zgartira oladi
+          isOwnerOrAdmin() ||
+          // A'zo o'zining ba'zi holatlarini yangilashi mumkin (masalan, customTitle o'zgartira olmaydi)
+          (memberId == request.auth.uid && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'permissions']))
+        );
+
+        allow delete: if isAuthenticated() && (
+          // A'zo o'zi chiqib ketishi mumkin (leave)
+          memberId == request.auth.uid ||
+          // Admin yoki Owner a'zoni chiqarib yuborishi mumkin (kick)
+          isOwnerOrAdmin()
+        );
+      }
+
+      // Xabarlar subcollection'i (Messages subcollection)
+      match /messages/{messageId} {
+        
+        function canSendInChannel() {
+          return isOwnerOrAdmin();
+        }
+
+        function canSendInGroup() {
+          return isMember() && (
+            !memberDocExists(request.auth.uid) || (
+              getMemberData(request.auth.uid).role != 'banned' &&
+              getMemberData(request.auth.uid).role != 'restricted' &&
+              (getMemberData(request.auth.uid).permissions.canSendMessages != false)
+            )
+          );
+        }
+
+        // Xabarlarni o'qish (Read):
+        allow read: if isAuthenticated() && (
+          isPublicChat() || isMember()
+        );
+
+        // Xabar yaratish (Create):
+        allow create: if isAuthenticated() && (
+          // Kanalda faqat admin va owner post yoza oladi
+          (getChat().isChannel == true && canSendInChannel()) ||
+          // Guruhda yoki shaxsiy chatda ruxsat berilgan a'zolar
+          (getChat().isChannel != true && canSendInGroup())
+        ) && request.resource.data.senderId == request.auth.uid;
+
+        // Xabarni tahrirlash (Update):
+        // 1. Xabar egasi tahrirlashi mumkin (matn, isEdited)
+        // 2. Har qanday o'quvchi/a'zo reaksiya qoldirishi ('reactions') yoki ko'rishlar sonini oshirishi ('viewsCount') mumkin
+        // 3. A'zolar so'rovnomada ovoz berishi ('poll') mumkin
+        // 4. Admin pinned holatini o'zgartira oladi
+        allow update: if isAuthenticated() && (
+          // Xabar egasi tahrirlashi
+          (resource.data.senderId == request.auth.uid && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['text', 'isEdited', 'reactions', 'isRead', 'poll'])) ||
+          // Reaksiya qoldirish
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions']) ||
+          // Ko'rishlar hisoblagichi (viewsCount)
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['viewsCount']) ||
+          // Ulashishlar hisoblagichi (forwardCount)
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['forwardCount']) ||
+          // Izohlar hisoblagichi (commentsCount)
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['commentsCount']) ||
+          // So'rovnomada ovoz berish yoki yakunlash (poll)
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['poll']) ||
+          // Xabarni o'qilgan deb belgilash
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead']) ||
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead', 'expiresAt']) ||
+          // Admin xabarni pin qilishi yoki boshqarishi
+          isOwnerOrAdmin()
+        );
+
+        // Xabarni o'chirish (Delete / Soft Delete):
+        allow delete: if isAuthenticated() && (
+          resource.data.senderId == request.auth.uid ||
+          isOwnerOrAdmin()
+        );
+
+        // Izohlar / Munozaralar subcollection'i (Post Comments Thread)
+        match /comments/{commentId} {
+          allow read: if isAuthenticated() && (
+            isPublicChat() || isMember()
+          );
+
+          allow create: if isAuthenticated() &&
+            request.resource.data.senderId == request.auth.uid;
+
+          allow update: if isAuthenticated() && (
+            // Izoh egasi tahrirlashi mumkin
+            (resource.data.senderId == request.auth.uid && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['text', 'isEdited', 'reactions'])) ||
+            // Reaksiya qoldirish
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions']) ||
+            isOwnerOrAdmin()
+          );
+
+          allow delete: if isAuthenticated() && (
+            resource.data.senderId == request.auth.uid ||
+            isOwnerOrAdmin()
+          );
+        }
+      }
+
+      // Jonli joylashuv sessiyalari (Live Location Sharing subcollection)
+      match /live_locations/{sessionId} {
+        // Faqat chat ishtirokchilari jonli joylashuvni ko'ra oladi
+        allow read: if isAuthenticated() && isMember();
+
+        // Faqat jo'natuvchi o'z nomidan va faqat tasdiqlangan muddatlar (15m = 900s, 1h = 3600s) bilan sessiya ochishi mumkin
+        allow create: if isAuthenticated() && isMember() &&
+          request.resource.data.senderId == request.auth.uid &&
+          request.resource.data.status == 'active' &&
+          request.resource.data.durationSeconds in [900, 3600] &&
+          request.resource.data.expiresAt > request.time;
+
+        // Faqat sessiya egasi o'z koordinatalarini yangilashi yoki muddatidan oldin to'xtatishi mumkin
+        // Muddati o'tgan yoki to'xtatilgan sessiyaga yangi koordinata yozib bo'lmaydi
+        allow update: if isAuthenticated() && isMember() &&
+          resource.data.senderId == request.auth.uid &&
+          resource.data.status == 'active' &&
+          (request.resource.data.status == 'stopped' || request.resource.data.status == 'expired' ||
+           (request.resource.data.status == 'active' && request.time < resource.data.expiresAt));
+
+        // Faqat sessiya egasi o'chira oladi
+        allow delete: if isAuthenticated() && isMember() &&
+          resource.data.senderId == request.auth.uid;
+      }
+
+      // Taklif havolalari (Invite links subcollection)
+      match /inviteLinks/{linkId} {
+        allow read: if isOwnerOrAdmin();
+        allow write: if isOwnerOrAdmin();
+      }
+
+      // Qo'shilish so'rovlari (Join requests subcollection)
+      match /joinRequests/{reqId} {
+        allow read: if isOwnerOrAdmin() || (isAuthenticated() && reqId == request.auth.uid);
+        allow create: if isAuthenticated() && reqId == request.auth.uid;
+        allow update, delete: if isOwnerOrAdmin();
+      }
+
+      // Mavzular (Topics subcollection for forums)
+      match /topics/{topicId} {
+        allow read: if isAuthenticated() && (isPublicChat() || isMember());
+        allow create, delete: if isOwnerOrAdmin() || (
+          isMember() && memberDocExists(request.auth.uid) &&
+          getMemberData(request.auth.uid).permissions.canManageTopics == true
+        );
+        allow update: if isOwnerOrAdmin() || (
+          (isMember() && memberDocExists(request.auth.uid) && getMemberData(request.auth.uid).permissions.canManageTopics == true) ||
+          (isMember() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['messagesCount', 'lastMessage', 'lastMessageTime']))
+        );
+      }
+    }
+
+    // Hikoyalar to'plami (Stories collection - 24 soatlik)
+    match /stories/{storyId} {
+      function isStoryOwner() {
+        return isAuthenticated() && (
+          resource.data.authorId == request.auth.uid ||
+          (resource.data.isChannel == true && exists(/databases/$(database)/documents/chats/$(resource.data.authorId)) &&
+           get(/databases/$(database)/documents/chats/$(resource.data.authorId)).data.createdBy == request.auth.uid) ||
+          (resource.data.isGroup == true && exists(/databases/$(database)/documents/chats/$(resource.data.authorId)) &&
+           get(/databases/$(database)/documents/chats/$(resource.data.authorId)).data.createdBy == request.auth.uid)
+        );
+      }
+
+      function hasDirectChatWithAuthor() {
+        return isAuthenticated() && (
+          exists(/databases/$(database)/documents/chats/$(request.auth.uid + '_' + resource.data.authorId)) ||
+          exists(/databases/$(database)/documents/chats/$(resource.data.authorId + '_' + request.auth.uid))
+        );
+      }
+
+      function isGroupStoryMember() {
+        return isAuthenticated() &&
+          resource.data.isGroup == true &&
+          exists(/databases/$(database)/documents/chats/$(resource.data.authorId)) &&
+          (
+            request.auth.uid in get(/databases/$(database)/documents/chats/$(resource.data.authorId)).data.participants ||
+            request.auth.uid == get(/databases/$(database)/documents/chats/$(resource.data.authorId)).data.createdBy
+          );
+      }
+
+      function isChannelStoryAuthorized() {
+        return isAuthenticated() &&
+          resource.data.isChannel == true &&
+          exists(/databases/$(database)/documents/chats/$(resource.data.authorId)) &&
+          (
+            get(/databases/$(database)/documents/chats/$(resource.data.authorId)).data.type != 'private' ||
+            request.auth.uid in get(/databases/$(database)/documents/chats/$(resource.data.authorId)).data.participants ||
+            request.auth.uid == get(/databases/$(database)/documents/chats/$(resource.data.authorId)).data.createdBy
+          );
+      }
+
+      function canReadStory() {
+        return isAuthenticated() && (
+          resource.data.authorId == request.auth.uid ||
+          hasDirectChatWithAuthor() ||
+          isGroupStoryMember() ||
+          isChannelStoryAuthorized()
+        );
+      }
+
+      // O'qish huquqi: faqat ruxsat etilgan bog'liqliklar uchun (Relationship-scoped privacy)
+      allow read: if canReadStory();
+
+      // Yaratish: o'z nomidan, yoki o'zi yaratgan/admin bo'lgan kanal/guruh nomidan
+      allow create: if isAuthenticated() && (
+        request.resource.data.authorId == request.auth.uid ||
+        (request.resource.data.isChannel == true && exists(/databases/$(database)/documents/chats/$(request.resource.data.authorId)) &&
+         get(/databases/$(database)/documents/chats/$(request.resource.data.authorId)).data.createdBy == request.auth.uid) ||
+        (request.resource.data.isGroup == true && exists(/databases/$(database)/documents/chats/$(request.resource.data.authorId)) &&
+         get(/databases/$(database)/documents/chats/$(request.resource.data.authorId)).data.createdBy == request.auth.uid)
+      );
+
+      // Hikoyani yangilash:
+      // - Muallif o'zgartira oladi
+      // - Ruxsat etilgan tomoshabinlar ko'rishlar (viewersCount, viewersData) va reaksiyalarni yangilay oladi
+      allow update: if isAuthenticated() && (
+        resource.data.authorId == request.auth.uid ||
+        (canReadStory() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['viewersCount', 'viewersData', 'reactions']))
+      );
+
+      // Hikoyani faqat muallif yoki kanal/guruh egasi o'chira oladi
+      allow delete: if isStoryOwner();
+    }
+
+    // Jonli ovozli efirlar to'plami (Voice Chats / Clubhouse Spaces)
+    match /voice_chats/{chatId} {
+      // Autentifikatsiyadan o'tgan foydalanuvchilar o'qiy oladi
+      allow read: if isAuthenticated();
+
+      // Guruh yoki kanal a'zosi/admini yangi ovozli efir boshlashi mumkin
+      allow create: if isAuthenticated();
+
+      // Ishtirokchilar qo'shilish/chiqish/qo'l ko'tarish, host esa ruxsat berish/yakunlash huquqiga ega
+      allow update: if isAuthenticated();
+
+      // Faqat host efirni o'chira oladi
+      allow delete: if isAuthenticated() &&
+        resource.data.hostId == request.auth.uid;
+    }
+
+    // Maxfiy chatlar to'plami (Secret Chats - Signal Protocol E2EE)
+    match /secret_chats/{chatId} {
+      function isSecretParticipant() {
+        return isAuthenticated() && (
+          request.auth.uid in resource.data.participants
+        );
+      }
+
+      function isValidSecretChatCreation() {
+        return isAuthenticated() &&
+          request.resource.data.participants.size() == 2 &&
+          request.auth.uid in request.resource.data.participants &&
+          request.resource.data.initiatorUid == request.auth.uid &&
+          request.resource.data.status == 'active';
+      }
+
+      allow read: if isSecretParticipant();
+      allow create: if isValidSecretChatCreation();
+      allow update: if isSecretParticipant() && (
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']) ||
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['selfDestructDuration'])
+      );
+      allow delete: if false;
+
+      // Maxfiy xabarlar konverti (Encrypted message envelope)
+      match /messages/{messageId} {
+        function getSecretChat() {
+          return get(/databases/$(database)/documents/secret_chats/$(chatId)).data;
+        }
+
+        function isSenderDeviceValid() {
+          return exists(/databases/$(database)/documents/users/$(request.auth.uid)/devices/$(request.resource.data.senderDeviceId)) &&
+            get(/databases/$(database)/documents/users/$(request.auth.uid)/devices/$(request.resource.data.senderDeviceId)).data.revoked == false;
+        }
+
+        allow read: if isAuthenticated() && (
+          request.auth.uid in getSecretChat().participants
+        );
+
+        allow create: if isAuthenticated() &&
+          getSecretChat().status == 'active' &&
+          request.resource.data.senderId == request.auth.uid &&
+          request.auth.uid in getSecretChat().participants &&
+          request.resource.data.recipientDeviceId is string &&
+          isSenderDeviceValid() &&
+          !('text' in request.resource.data) &&
+          request.resource.data.payload is string &&
+          request.resource.data.protocolVersion == 1 &&
+          request.resource.data.envelopeType in [1, 2] &&
+          request.resource.data.isRead == false;
+
+        allow update: if isAuthenticated() && (
+          request.auth.uid in getSecretChat().participants &&
+          resource.data.senderId != request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead', 'readAt'])
+        );
+
+        allow delete: if isAuthenticated() && (
+          request.auth.uid in getSecretChat().participants
+        );
+      }
+    }
+  }
+}
+

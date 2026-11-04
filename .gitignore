@@ -1,0 +1,89 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.pyo
+*.swp
+.DS_Store
+Thumbs.db
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+analyze_output.txt
+walkthrough.md
+
+# Environment and Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cert
+
+# Python and Testing Caches
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node and Web Build Artifacts
+node_modules/
+.next/
+dist/
+*.tsbuildinfo
+
+# Python Virtual Environments
+.venv/
+venv/
+
+# IntelliJ / IDE related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+**/build/
+/coverage/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio and Gradle build artifacts
+/android/app/debug
+/android/app/profile
+/android/app/release
+android/build/
+android/.gradle/
+android/.kotlin/
+**/android/.gradle/
+**/android/.kotlin/
+
+# Uploads and temporary runtime documents
+storage/uploads/
+**/storage/uploads/*
+!**/storage/uploads/.gitkeep
